@@ -11,6 +11,8 @@ jobs:
   pool:
     vmImage: ${{ parameters.imageName }}
   displayName: ${{ parameters.displayName }}
+  variables:
+  - group: InstallDSC
   steps:
   - ${{ parameters.powershellExecutable }}: |
         Install-Module -Name 'Microsoft.PowerShell.SecretManagement' -force -SkipPublisherCheck -AllowClobber
@@ -20,6 +22,11 @@ jobs:
         Register-SecretVault -Name SecretStore -ModuleName Microsoft.PowerShell.SecretStore -DefaultVault
     displayName: Install Secret store
     condition: eq(${{ parameters.useAzAuth }}, false)
+
+  - task: NuGetAuthenticate@1
+    displayName: Install Azure Artifacts Credential Provider
+    inputs:
+      forceReinstallCredentialProvider: true
 
   - task: DownloadBuildArtifacts@0
     displayName: 'Download artifacts'
@@ -70,6 +77,114 @@ jobs:
       ScriptType: InlineScript
       pwsh: true
       inline: |
+        Write-Verbose -Verbose "Setting up secret for Azure Artifacts Credential Provider"
+        $azt = (Get-AzAccessToken).Token | ConvertFrom-SecureString -AsPlainText
+
+        Write-Verbose -Verbose "Setting up Azure Artifacts Credential Provider secret - token - $azt"
+
+        $ADORepoName = "psrg-credprovidertest"
+        $ADORepoUri = "https://pkgs.dev.azure.com/powershell-rel/PSResourceGet/_packaging/psrg-credprovidertest/nuget/v2"
+
+        $endpointCredsObj = @{ endpointCredentials = @( @{ endpoint = $ADoRepoURI; password = $azt })}
+        $VSS_NUGET_EXTERNAL_FEED_ENDPOINTS = $endpointCredsObj | ConvertTo-Json -Compress
+
+        Write-Verbose -Verbose "Setting VSS_NUGET_EXTERNAL_FEED_ENDPOINTS environment variable $VSS_NUGET_EXTERNAL_FEED_ENDPOINTS"
+
+        $vstsCommandString = "vso[task.setvariable variable=VSS_NUGET_EXTERNAL_FEED_ENDPOINTS]$VSS_NUGET_EXTERNAL_FEED_ENDPOINTS"
+        Write-Host "sending " + $vstsCommandString
+        Write-Host "##$vstsCommandString"
+
+    displayName: 'Setup Azure Artifacts Credential Provider secret'
+    condition: eq(${{ parameters.useAzAuth }}, false)
+
+  - pwsh: |
+      $repo = "PowerShell/DSC"
+      $api  = "https://api.github.com/repos/$repo/releases"
+
+      $headers = @{
+          "User-Agent" = "pwsh"
+          "Accept"     = "application/vnd.github+json"
+          "Authorization" = "Bearer $env:GITHUB_TOKEN"
+      }
+
+      # Get releases
+      $releases = Invoke-RestMethod -Uri $api -Headers $headers -RetryIntervalSec 30 -MaximumRetryCount 10
+
+      # Pick latest by publish date (handles prerelease vs stable automatically)
+      $latest = $releases |
+          Sort-Object published_at -Descending |
+          Select-Object -First 1
+
+      Write-Host "Latest version: $($latest.tag_name) (prerelease=$($latest.prerelease))"
+
+      if ($IsWindows) {
+          $assetFilter = "x86_64-pc-windows-msvc"
+      }
+      elseif ($IsMacOs) {
+          $assetFilter = "x86_64-apple-darwin"
+      }
+      else {
+          $assetFilter = "x86_64-linux"
+      }
+
+      $assets = $latest.assets |
+          Where-Object { $_.name -match $assetFilter }
+
+      Write-Host "Filtered assets: $($assets.Count)"
+
+      $selectedAsset = $assets | Select-Object -First 1
+
+      Write-Host "Selected asset: $($selectedAsset.name)"
+
+      $outFile = Join-Path $PWD $selectedAsset.name
+
+      Write-Host "Downloading $($selectedAsset.name)"
+
+      Invoke-WebRequest `
+          -Uri $selectedAsset.browser_download_url `
+          -Headers @{ "User-Agent"="pwsh" } `
+          -OutFile $outFile
+
+
+      if ($IsWindows) {
+        Expand-Archive -Path $outFile -DestinationPath $env:AGENT_TEMPDIRECTORY -Force -Verbose
+      }
+      else {
+        tar -xzf $outFile -C $env:AGENT_TEMPDIRECTORY
+      }
+
+      $executableName = 'dsc'
+      $executableExt = if ($IsWindows) { '.exe' } else { '' }
+
+      $executableFileName = $executableName + $executableExt
+
+      $executable = Get-ChildItem -Path $env:AGENT_TEMPDIRECTORY -File -Recurse -Verbose | Where-Object { $_.Name -eq $executableFileName } | Select-Object -First 1
+
+      if (-not $executable) {
+        throw "Could not find dsc executable in the downloaded package"
+      }
+
+      $dscRoot = Split-Path -Path $executable.FullName -Parent
+
+      $vstsCommandString = "vso[task.setvariable variable=DSC_ROOT]$dscRoot"
+      Write-Host "sending " + $vstsCommandString
+      Write-Host "##$vstsCommandString"
+
+    displayName: 'Install latest DSC v3'
+    env:
+      GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+  - pwsh: |
+      Get-ChildItem -Path env: | Out-String -width 9999 -Stream | Write-Verbose -Verbose
+    displayName: Capture environment
+
+  - task: AzurePowerShell@5
+    inputs:
+      azureSubscription: PSResourceGetACR
+      azurePowerShellVersion: LatestVersion
+      ScriptType: InlineScript
+      pwsh: true
+      inline: |
         Write-Verbose -Verbose "Getting Azure Container Registry"
         Get-AzContainerRegistry -ResourceGroupName 'PSResourceGet' -Name 'psresourcegettest' | Select-Object -Property *
         Write-Verbose -Verbose "Setting up secret for Azure Container Registry"
@@ -107,10 +222,12 @@ jobs:
     inputs:
       azureSubscription: PSResourceGetACR
       azurePowerShellVersion: LatestVersion
+      pwsh: true
       ScriptType: InlineScript
       inline: |
         $modulePath = Join-Path -Path $env:AGENT_TEMPDIRECTORY -ChildPath 'TempModules'
         $env:PSModulePath = $modulePath + [System.IO.Path]::PathSeparator + $env:PSModulePath
+
         Write-Verbose -Verbose "Importing build utilities (buildtools.psd1)"
         Import-Module -Name (Join-Path -Path '${{ parameters.buildDirectory }}' -ChildPath 'buildtools.psd1') -Force
         Invoke-ModuleTestsACR -Type Functional
